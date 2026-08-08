@@ -1,12 +1,22 @@
--- harness.lua — AO agent harness for HyperBEAM
--- Demonstrates: llm@1.0 + relay@1.0 + cache/store + query@1.0 + lua bash
+-- harness.lua — Generic AO agent harness for HyperBEAM
+-- Demonstrates: llm@1.0 + relay@1.0 (tools) + store/cache FS + query@1.0 + lua bash
+-- Generic: any URL/collection — dan-feed is just default test dataset
 -- Load: aos <PROC> < src/preloaded/agent/harness.lua
 
--- 1. Ingest Daily Agents News → cache + index
-Handlers.add("ingest-dan", Handlers.utils.hasMatchingTag("Action", "IngestDAN"), function(msg)
-  print("Harness: fetching dan-feed via harness@1.0...")
+-- 1. Generic ingest: fetch any URL via relay → store → index (dan is default)
+Handlers.add("ingest", Handlers.utils.hasMatchingTag("Action", "Ingest"), function(msg)
+  local url = msg.Tags.Url or msg.Data or "https://hyperio-mc.github.io/dan-feed/feed.xml"
+  local collection = msg.Tags.Collection or "dan"
+  print("Harness: fetching "..url.." via relay -> "..collection.." ...")
   local ok, res = pcall(function()
-    return ao.resolve({device="harness@1.0", path="ingest"})
+    return ao.resolve({device="harness@1.0", path="ingest", url=url, collection=collection})
+  end)
+  -- keep IngestDAN as alias for demo
+end)
+Handlers.add("ingest-dan", Handlers.utils.hasMatchingTag("Action", "IngestDAN"), function(msg)
+  print("Harness: fetching dan-feed via harness@1.0 (dan collection)...")
+  local ok, res = pcall(function()
+    return ao.resolve({device="harness@1.0", path="ingest", url="https://hyperio-mc.github.io/dan-feed/feed.xml", collection="dan"})
   end)
   if not ok then
     print("ingest failed: "..tostring(res))
@@ -24,36 +34,61 @@ Handlers.add("ingest-dan", Handlers.utils.hasMatchingTag("Action", "IngestDAN"),
   Send({Target=msg.From, Data="Ingested "..tostring(ingested).." posts. Summary: "..summary})
 end)
 
--- 2. Query cache (query@1.0 style via harness)
+-- 2. Generic query: any collection via harness (dan default), plus QueryDAN alias
+Handlers.add("query", Handlers.utils.hasMatchingTag("Action", "Query"), function(msg)
+  local q = msg.Tags.Query or msg.Data or ""
+  local collection = msg.Tags.Collection or "dan"
+  local ok, res = ao.resolve({device="harness@1.0", path="query", q=q, collection=collection})
+end)
 Handlers.add("query-dan", Handlers.utils.hasMatchingTag("Action", "QueryDAN"), function(msg)
   local q = msg.Tags.Query or msg.Data or ""
-  local ok, res = ao.resolve({device="harness@1.0", path="query", q=q})
+  local ok, res = ao.resolve({device="harness@1.0", path="query", q=q, collection="dan"})
   if not ok then Send({Target=msg.From, Data="query failed"}); return end
   local results = res.results or {}
   Send({Target=msg.From, Data=require("json").encode({count=res.count or #results, q=q, results=results})})
 end)
 
+Handlers.add("list", Handlers.utils.hasMatchingTag("Action", "List"), function(msg)
+  local collection = msg.Tags.Collection or "dan"
+  local ok, res = ao.resolve({device="harness@1.0", path="list", collection=collection})
+end)
 Handlers.add("list-dan", Handlers.utils.hasMatchingTag("Action", "ListDAN"), function(msg)
-  local ok, res = ao.resolve({device="harness@1.0", path="list"})
+  local ok, res = ao.resolve({device="harness@1.0", path="list", collection="dan"})
   Send({Target=msg.From, Data=require("json").encode(res)})
 end)
 
--- 3. Agent loop: llm decides, relay acts, cache stores, query indexes
+-- 3. Agent loop: harness@1.0/handle — message + history + tools -> llm loop -> tool dispatch -> store
+-- Meets standard: takes message, last-turn history (via collection), and tools, loops until no tool_calls
 Handlers.add("agent-run", Handlers.utils.hasMatchingTag("Action", "AgentRun"), function(msg)
   local prompt = msg.Data or msg.Tags.Prompt or "What should the agent do next?"
-  -- LLM decides
-  local ok, llm = ao.resolve({device="llm@1.0", path="chat", prompt=prompt, model="qwen3.6"})
-  if not ok then Send({Target=msg.From, Data="llm failed"}); return end
-  local body = llm.body or ""
-  local decoded = require("json").decode(body)
-  local plan = decoded.choices and decoded.choices[1].message.content or body
-  print("Agent plan: "..string.sub(plan,1,200))
-  -- Relay to external tool (example: fetch dan-feed via relay)
-  local r_ok, r_res = ao.resolve({device="relay@1.0", path="call", ["relay-path"]="https://hyperio-mc.github.io/dan-feed/feed.xml", ["relay-method"]="GET"})
-  local tool_out = r_ok and (r_res.body or "") or "relay failed"
-  -- Store to cache via harness
-  ao.resolve({device="harness@1.0", path="store", posts={{guid="agent-"..tostring(math.random(100000)), title="Agent run", link="", description=plan}}})
-  Send({Target=msg.From, Data="Plan: "..string.sub(plan,1,300).."\nTool bytes: "..tostring(#tool_out)})
+  local collection = msg.Tags.Collection or "agent"
+  local tools = {
+    {
+      type = "function",
+      ["function"] = {
+        name = "fetch",
+        description = "Fetch any URL via relay@1.0",
+        parameters = {
+          type = "object",
+          properties = {
+            ["relay-path"] = {type = "string", description = "URL to fetch"},
+            ["relay-method"] = {type = "string", description = "HTTP method"},
+            ["relay-body"] = {type = "string", description = "Optional body"}
+          },
+          required = {"relay-path"}
+        }
+      }
+    }
+  }
+  -- Harness builds context (prompt + history from collection + tools), calls llm, dispatches tool_calls via relay, loops, stores history
+  local ok, res = ao.resolve({device="harness@1.0", path="handle", message=prompt, tools=tools, collection=collection, model="qwen3.6"})
+  if not ok then Send({Target=msg.From, Data="harness failed: "..tostring(res)}); return end
+  local output = res.output or res.content or ""
+  local iterations = res.iterations or 1
+  print("Agent output ("..tostring(iterations).." iters): "..string.sub(output,1,300))
+  -- Optionally store final output as post
+  ao.resolve({device="harness@1.0", path="store", posts={{guid="agent-"..tostring(math.random(100000)), title="Agent run", link="", description=output}}, collection=collection})
+  Send({Target=msg.From, Data="Output: "..string.sub(output,1,500).."\nIterations: "..tostring(iterations)})
 end)
 
 -- 4. Bash-like via lua (lua is the bash)
@@ -65,4 +100,4 @@ Handlers.add("bash", Handlers.utils.hasMatchingTag("Action", "Bash"), function(m
   Send({Target=msg.From, Data=res.content or ""})
 end)
 
-print("Harness loaded: IngestDAN, QueryDAN, ListDAN, AgentRun, Bash — llm+relay+cache+query")
+print("Harness loaded: Ingest/Query/List (generic, dan default) + IngestDAN/QueryDAN/ListDAN aliases, AgentRun, Bash — llm+relay+cache+query; relay used for fetch")

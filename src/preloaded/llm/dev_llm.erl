@@ -10,7 +10,7 @@
 -module(dev_llm).
 -implements(<<"llm@1.0">>).
 -export([info/1, chat/3, generate/3, embed/3, embeddings/3]).
--export([resolve_endpoint/4, build_chat_body/4, is_stream/2, extract_content/1]).
+-export([resolve_endpoint/4, build_chat_body/4, build_chat_body/5, is_stream/2, extract_content/1]).
 
 -include_lib("eunit/include/eunit.hrl").
 
@@ -28,7 +28,7 @@ chat(Base, Req, Opts) ->
     RawModel = get_val(<<"model">>, [Req, Base], <<"unsloth/Qwen3.6-35B-A3B-NVFP4">>, Opts),
     Model = normalize_model(RawModel),
     Stream = is_stream(Req, Opts),
-    Body = build_chat_body(Req, Model, Stream, Opts),
+    Body = build_chat_body(Base, Req, Model, Stream, Opts),
     Headers = #{<<"content-type">> => <<"application/json">>},
     case Stream of
         true ->
@@ -162,28 +162,50 @@ resolve_endpoint(Base, Req, Opts, Type) ->
     end.
 
 build_chat_body(Req, Model, Stream, Opts) ->
-    Prompt = get_val(<<"prompt">>, [Req], undefined, Opts),
-    MessagesRaw = get_val(<<"messages">>, [Req], undefined, Opts),
-    Data = get_val(<<"data">>, [Req], undefined, Opts),
+    build_chat_body(#{}, Req, Model, Stream, Opts).
+
+build_chat_body(Base, Req, Model, Stream, Opts) ->
+    Prompt = get_val(<<"prompt">>, [Req, Base], undefined, Opts),
+    MessagesRaw0 = get_val(<<"messages">>, [Req, Base], undefined, Opts),
+    MessagesRaw = deep_deref(MessagesRaw0, Opts),
+    Data = get_val(<<"data">>, [Req, Base], undefined, Opts),
     Messages = case {MessagesRaw, Prompt, Data} of
         {undefined, undefined, undefined} -> [#{<<"role">> => <<"user">>, <<"content">> => <<>>}];
-        {undefined, P, _} when P =/= undefined -> [#{<<"role">> => <<"user">>, <<"content">> => P}];
-        {undefined, undefined, D} when D =/= undefined -> [#{<<"role">> => <<"user">>, <<"content">> => D}];
+        {undefined, P, _} when P =/= undefined -> [#{<<"role">> => <<"user">>, <<"content">> => hb_util:bin(P)}];
+        {undefined, undefined, D} when D =/= undefined -> [#{<<"role">> => <<"user">>, <<"content">> => hb_util:bin(D)}];
         {M, _, _} when is_binary(M) ->
             try hb_json:decode(M) catch _:_ -> [#{<<"role">> => <<"user">>, <<"content">> => M}] end;
-        {M, _, _} -> M
+        {M, _, _} -> deep_deref(M, Opts)
     end,
-    HasRawBody = get_val(<<"body">>, [Req], undefined, Opts),
+    Tools0 = get_val(<<"tools">>, [Req, Base], undefined, Opts),
+    Tools = deep_deref(Tools0, Opts),
+    ToolChoice = get_val(<<"tool_choice">>, [Req, Base], get_val(<<"tool-choice">>, [Req, Base], undefined, Opts), Opts),
+    HasRawBody = get_val(<<"body">>, [Req, Base], undefined, Opts),
     case HasRawBody of
         undefined ->
-            hb_json:encode(#{
+            BaseBody = #{
                 <<"model">> => Model,
                 <<"messages">> => Messages,
                 <<"stream">> => Stream
-            });
+            },
+            BodyWithTools = case Tools of
+                undefined -> BaseBody;
+                _ -> BaseBody#{ <<"tools">> => Tools }
+            end,
+            BodyFinal = case ToolChoice of
+                undefined -> BodyWithTools;
+                _ -> BodyWithTools#{ <<"tool_choice">> => ToolChoice }
+            end,
+            hb_json:encode(BodyFinal);
         B when is_binary(B) -> B;
         B when is_map(B) -> hb_json:encode(B#{ <<"stream">> => Stream });
-        _ -> hb_json:encode(#{<<"model">> => Model, <<"messages">> => Messages, <<"stream">> => Stream})
+        _ ->
+            BaseBody2 = #{<<"model">> => Model, <<"messages">> => Messages, <<"stream">> => Stream},
+            BodyWithTools2 = case Tools of
+                undefined -> BaseBody2;
+                _ -> BaseBody2#{ <<"tools">> => Tools }
+            end,
+            hb_json:encode(BodyWithTools2)
     end.
 
 is_stream(Req, Opts) ->
@@ -217,22 +239,38 @@ do_request(Endpoint, Body, Headers, Opts) ->
         Other -> {error, #{ <<"body">> => hb_util:bin(Other) }}
     end.
 
-get_val(Key, Maps, Default, _Opts) when is_list(Maps) ->
+get_val(Key, Maps, Default, Opts) when is_list(Maps) ->
     case Maps of
         [] -> Default;
-        [H|T] -> get_val(Key, H, get_val(Key, T, Default, _Opts), _Opts)
+        [H|T] -> get_val(Key, H, get_val(Key, T, Default, Opts), Opts)
     end;
-get_val(Key, Map, Default, _Opts) when is_map(Map) ->
-    case maps:find(Key, Map) of
+get_val(Key, Map, Default, Opts) when is_map(Map) ->
+    % Use hb_maps:find to handle link dereferencing via hb_cache
+    case hb_maps:find(Key, Map, Opts) of
         {ok, V} -> V;
         error ->
             AtomKey = try binary_to_existing_atom(Key, utf8) catch _:_ -> undefined end,
             case AtomKey of
                 undefined -> Default;
-                _ -> case maps:find(AtomKey, Map) of {ok, V} -> V; error -> Default end
+                _ -> case hb_maps:find(AtomKey, Map, Opts) of {ok, V} -> V; error -> Default end
             end
     end;
 get_val(_, _, Default, _) -> Default.
+
+deep_deref(V, Opts) when is_map(V) ->
+    % Deref top-level if it's a link
+    case (catch hb_cache:ensure_loaded(V, Opts)) of
+        V2 when is_map(V2), V2 =/= V -> deep_deref(V2, Opts);
+        _ ->
+            maps:from_list([{K, deep_deref(Val, Opts)} || {K, Val} <- maps:to_list(V)])
+    end;
+deep_deref(V, Opts) when is_list(V) ->
+    [deep_deref(X, Opts) || X <- V];
+deep_deref(V, Opts) ->
+    case (catch hb_cache:ensure_loaded(V, Opts)) of
+        V2 when V2 =/= V -> deep_deref(V2, Opts);
+        _ -> V
+    end.
 
 extract_content(#{ <<"choices">> := [#{ <<"message">> := #{ <<"content">> := C }}|_] }) -> C;
 extract_content(#{ <<"choices">> := [#{ <<"delta">> := #{ <<"content">> := C }}|_] }) -> C;

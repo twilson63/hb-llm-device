@@ -1,167 +1,68 @@
-# hb-llm-device — `llm@1.0` for HyperBEAM
+# hb-llm-device — LLM Agent Stack for HyperBEAM
 
-OpenAI-compatible LLM proxy for HyperBEAM. Use local Ollama, vLLM, or `llama.cpp` — or a remote vLLM like `spark-1b7b.local:8888` — from any AO process or via HTTP. Bypasses `dev_relay` localhost block by calling `hb_http` directly.
+**Agent = LLM + Harness + Tools + Instructions** — one harness, many agents. See [What is an Agent?](https://chat.hyper.io/share/wE41XruWrXFj37EdGfFxn3sdXy0Wib9e) and [Agent Flow](https://chat.hyper.io/share/_4kT2xkDzGpPncXP5k6wx8zB5m4LKlnT).
 
-- `chat` → `POST /v1/chat/completions` (supports `stream=true` → SSE `text/event-stream`)
-- `generate` → `chat` + extracts `choices[0].message.content` → `content` (+ `raw`)
-- `embed`/`embeddings` → `POST /v1/embeddings` → `embedding`/`embeddings`/`raw`
-- `qwen3.6` alias → `unsloth/Qwen3.6-35B-A3B-NVFP4` (Spark), `stream`, `endpoint`/`embed-endpoint`/`llm-endpoint` overrides
+This repo packages the full agent stack as HyperBEAM devices (Forge `device`):
 
-Default endpoint `http://spark-1b7b.local:8888/v1/chat/completions` (Spark `qwen3.6`), default model `unsloth/Qwen3.6-35B-A3B-NVFP4`. Override per-request — also works with local Ollama `http://localhost:11434`.
+* `llm@1.0` (`src/preloaded/llm/dev_llm.erl`) — OpenAI-compatible proxy for Ollama/vLLM/llama.cpp (`POST /v1/chat/completions`, `stream=true` → SSE, `POST /v1/embeddings`). Bypasses `dev_relay` localhost block via `hb_http`. Default `qwen3.6` (`unsloth/Qwen3.6-35B-A3B-NVFP4`) on `spark-1b7b.local:8888`, override via `endpoint`.
+* `harness@1.0` (`src/preloaded/agent/dev_harness.erl`) — Generic loop: builds `system(identity.md+soul.md+user.md)+tools.json+history↑20+current` window, calls `llm@1.0`, runs `tool_calls` via `relay@1.0`, rebuilds until no tools, persists `history` to `hb_store`.
+* `skills@1.0` (`src/preloaded/agent/dev_skills.erl`) — Composable registry: `register/get/list/check/run/compose`, enforces `requires_tools ⊆ tools.json` matrix, delegates to harness.
+* `agent` process (`src/preloaded/agent/agent.lua` + `harness.lua`) — `RunSkill`/`AgentPrompt` loads `agents/<id>/{identity.md,user.md,soul.md,tools.json}` + `memory/*.md`, checks skills, runs via harness.
 
-## Why not just `dev_relay@1.0`?
-
-`dev_relay` blocks `localhost`/`127.0.0.1`/private IPs by default (`relay-block-internal=true`, `hb_hostname:is_public`). This device calls `hb_http:request` directly, so `http://localhost:11434` and `http://spark-1b7b.local:8888` work without `HB_RELAY_BLOCK_INTERNAL=false`. If you *do* want relay, `HB_RELAY_BLOCK_INTERNAL=false rebar3 shell`.
-
-## Install
+## Quick start
 
 ```bash
-# Option A: copy into HyperBEAM (preloaded)
-cp src/preloaded/llm/dev_llm.erl /path/to/hyperbeam/src/preloaded/llm/
-cp src/preloaded/llm/llm_sidecar.lua /path/to/hyperbeam/src/preloaded/llm/
+# Install
+git clone https://github.com/twilson63/hb-llm-device && cd hb-llm-device
 rebar3 compile
-rebar3 device preload  # rebuilds _build/preloaded-store, index -> llm@1.0
+rebar3 device preload  # or rebar3 device local
 
-# Option B: standalone repo as dep
-# in your rebar.config: {deps, [{hb_llm_device, {git, "https://github.com/twilson63/hb-llm-device.git", {branch, "main"}}}]}
+# Run local LLM (Ollama)
+ollama serve &; ollama pull llama3.2; ollama pull qwen3.6:27b
+
+# Test harness + skills (mock)
+rebar3 device test
+# or against HyperBEAM core
+rebar3 device test --with-core
+
+# Publish to Forge (Arweave)
+rebar3 device publish --device-src src/preloaded/llm --dry-run --verbose
+rebar3 device publish --device-src src/preloaded/agent --dry-run --verbose
+rebar3 device publish --verbose  # all
+
+# Example: water vs space essay (see HyperBEAM examples/datacenter-essay)
+# hyperbeam/examples/datacenter-essay/{skills.json,agents/researcher/*,essay.out.md}
 ```
 
-## Run a local AI with Ollama
+## HyperBEAM integration
+
+Copy into HyperBEAM:
 
 ```bash
-# Install https://ollama.com
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Start server ( :11434 )
-ollama serve &
-# Pull models
-ollama pull llama3.2          # 3B default for Ollama
-ollama pull qwen3.6:27b-coding-nvfp4  # or use Spark's qwen3.6 (35B) via spark-1b7b.local:8888
-ollama pull nomic-embed-text  # for embeddings
-ollama list  # should show llama3.2, qwen3.6, nomic-embed-text, glm-5.2:cloud etc.
-
-# Verify Ollama API
-curl http://localhost:11434/v1/models
-curl http://localhost:11434/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model":"llama3.2","messages":[{"role":"user","content":"Say hi in 3 words"}],"stream":false}'
+cp src/preloaded/llm/* /path/to/hyperbeam/src/preloaded/llm/
+cp src/preloaded/agent/* /path/to/hyperbeam/src/preloaded/agent/
+rebar3 compile && rebar3 device preload
 ```
 
-**Alternatives:**
-
-```bash
-# vLLM OpenAI-compatible (e.g. Spark)
-python -m vllm.entrypoints.openai.api_server --model unsloth/Qwen3.6-35B-A3B-NVFP4 --port 8888 --host 0.0.0.0
-# llama.cpp
-llama-server -m qwen3.6-35b.gguf --port 8080 --host 127.0.0.1
-```
-
-## Test
-
-```bash
-# 1. Simple prompt (GET, default Spark qwen3.6) — no endpoint needed
-curl "http://localhost:8734/~llm@1.0/chat?prompt=Write+a+haiku+about+AO"
-
-# 2. Local Ollama llama3.2 (explicit endpoint)
-curl "http://localhost:8734/~llm@1.0/chat?prompt=hello&endpoint=http://localhost:11434/v1/chat/completions&model=llama3.2"
-curl -X POST http://localhost:8734/~llm@1.0/chat -H "content-type: application/json" \
-  -d '{"messages":[{"role":"user","content":"What is HyperBEAM?"}],"model":"llama3.2","endpoint":"http://localhost:11434/v1/chat/completions"}'
-
-# 3. Spark qwen3.6 via alias (default)
-curl "http://localhost:8734/~llm@1.0/chat?prompt=hello&model=qwen3.6"
-# or explicit full:
-curl "http://localhost:8734/~llm@1.0/chat?prompt=hello&endpoint=http://spark-1b7b.local:8888/v1/chat/completions&model=unsloth/Qwen3.6-35B-A3B-NVFP4"
-
-# 4. Streaming SSE
-curl "http://localhost:8734/~llm@1.0/chat?prompt=Count+1+to+3&stream=true&model=qwen3.6"  # → data: {"delta":{"content":"1"}} … [DONE]
-
-# 5. Embeddings (Ollama local)
-curl -X POST http://localhost:8734/~llm@1.0/embed -H "content-type: application/json" \
-  -d '{"input":"hello world","model":"nomic-embed-text","embed-endpoint":"http://localhost:11434/v1/embeddings"}'
-
-# 6. Via AO process (set default on process)
-# hb message commit --process <PROC> '{"device":"llm@1.0","llm-endpoint":"http://localhost:11434/v1/chat/completions","model":"llama3.2"}'
-# or for Spark: '{"llm-endpoint":"http://spark-1b7b.local:8888/v1/chat/completions","model":"qwen3.6"}'
-```
-
-## From AO / Lua
-
-Load `src/preloaded/llm/llm_sidecar.lua` into your AO process:
-
-```bash
-aos <PROC> < src/preloaded/llm/llm_sidecar.lua
-```
-
-```lua
--- non-stream
-local res = ao.send({
-  Device = "llm@1.0",
-  Action = "chat",
-  Tags = { Prompt = "Explain AO in one sentence", Model = "qwen3.6" }
-})
-print(res.Data)
-
--- streaming (sidecar sends Stream-Chunk / Stream-Done)
-Send({ Target = ao.id, Action = "Chat", Prompt = "Count 1 to 5", Stream = "true", Model = "qwen3.6" })
-
--- or direct ao.resolve (no sidecar)
-local status, res = ao.resolve({device='llm@1.0', path='chat', prompt='Say hi', model='qwen3.6', endpoint='http://spark-1b7b.local:8888/v1/chat/completions'})
-print(res.body)
-
--- explicit Ollama endpoint
-local status, res = ao.resolve({device='llm@1.0', path='chat', prompt='hi', model='llama3.2', endpoint='http://localhost:11434/v1/chat/completions'})
-```
-
-## Endpoints
-
-- `chat` / `completions` — `POST /v1/chat/completions` passthrough (`messages` or `prompt`/`data` → `messages`, `model`, `stream`)
-- `generate` — same as `chat` but extracts `choices[0].message.content` → `content` for easier AO use
-- `embed` / `embeddings` — `POST /v1/embeddings` → `embedding`/`embeddings`
-
-Overrides per-request: `endpoint` (chat), `embed-endpoint` (embed), `model`, `prompt`/`messages`/`data`, `stream` (`true`/`1`), or process Base `llm-endpoint`/`llm-embed-endpoint`.
-
-## Security
-
-This device can `POST` to any `endpoint` you pass — including `localhost` and private LAN `spark-1b7b.local`. Do not expose a node running it to the public internet without auth. Put it behind `hb` admin (`--admin`) or a reverse proxy, or restrict `llm-endpoint` to an allowlist.
-
-## Harness (agent) — `harness@1.0`
-
-Bundled with `llm@1.0` — `src/preloaded/agent/dev_harness.erl` + `harness.lua`.
-
-- `fetch` → `GET https://hyperio-mc.github.io/dan-feed/feed.xml` via `hb_http`
-- `parse` → RSS `item` → `#{guid,title,link,description}`
-- `store`/`ingest` → `hb_store` `dan-<guid> => JSON` + `dan-index => [guid]` (cache FS)
-- `list` → `dan-index` count, `query q=OpenAI` → filter `title|description`
-- `harness.lua` `IngestDAN|QueryDAN|ListDAN|AgentRun|Bash` — uses `llm@1.0` (`qwen3.6` on Spark), `relay@1.0`, `query@1.0`, `lua@5.3a` bash
+Or as dep in `rebar.config`:
 
 ```erlang
-hb_ao:resolve(#{<<"device">>=><<"harness@1.0">>, <<"path">>=><<"ingest">>}, #{}) % 1125 posts
-dev_harness:query(#{}, #{<<"q">> => <<"Muse Code">>}, #{}) % → 2 hits
-```
-```lua
--- AO: aos <proc> < src/preloaded/agent/harness.lua
-Send({Target=Proc, Action="IngestDAN"})
-Send({Target=Proc, Action="QueryDAN", Tags={Query="Muse Code"}})
+{deps, [{hb_llm_device, {git, "https://github.com/twilson63/hb-llm-device.git", {branch, "main"}}}]}.
 ```
 
-## Forge publish
+## Publish to Molecule (permagit)
 
 ```bash
-rebar3 device publish --device-src src/preloaded/llm --verbose
-# dry-run:
-rebar3 device publish --device-src src/preloaded/llm --dry-run --verbose
-# Spec: PD89PcLv_ilAtTxDOPtbKLXNq4be5eBCMXJi1BS7KsY, Impl: RFJL5SpFbLN1X3LuqYnPDw4W02n5c4l8HGu-17tB-N8 (v1)
+curl -fsSL https://arweave.net/dSpQZnHnpkHGmiLrLliONDVgIPIx5-ZNgOjwY9tSkPY | bash  # permagit 0.11.3
+permagit init hb-llm-device
+git add -A && git commit -m "feat: agent stack"
+permagit push main
+git clone arweave://hb-llm-device
 ```
 
-Published via `httpsig@1.0`, verifiable on Arweave. Others can `hb_ao:resolve({device=><<"llm@1.0">>})` after indexing or pin spec ID.
+Spec IDs (latest, signer `aa0b-vzWf7Sn4cFKI43P4MUcSgAdAjCH2V2IFTKZGfU`):
+* `llm@1.0` — Spec `2fJihfIyiV3iN7LYA0HMSRV8_pxUx3zkBoi8ZtNV7bE`
+* `harness@1.0` — Spec `r09P4ZkjHMtGIDGRXv_43_CWs2PEwENlPvJwTcf1X-4`
+* `skills@1.0` — Spec `isu2v3tmV3RmXrQhW6PJlsXDd3A8ktDAv871NjCutxg`
 
-## Tests
-
-```bash
-rebar3 eunit --module dev_llm_test          # 12 mock + unit, no network
-LLM_LIVE=1 rebar3 eunit --module dev_llm_test  # hits live Spark qwen3.6 (or Ollama)
-rebar3 eunit                                 # full 987
-```
-
-## License
-
-Apache-2.0
+See `src/preloaded/agent/agent.lua` and HyperBEAM `examples/datacenter-essay/` for full `research → write` flow.

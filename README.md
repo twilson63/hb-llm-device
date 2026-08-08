@@ -123,6 +123,26 @@ Overrides per-request: `endpoint` (chat), `embed-endpoint` (embed), `model`, `pr
 
 This device can `POST` to any `endpoint` you pass — including `localhost` and private LAN `spark-1b7b.local`. Do not expose a node running it to the public internet without auth. Put it behind `hb` admin (`--admin`) or a reverse proxy, or restrict `llm-endpoint` to an allowlist.
 
+## Harness (agent) — `harness@1.0`
+
+Bundled with `llm@1.0` — `src/preloaded/agent/dev_harness.erl` + `harness.lua`.
+
+- `fetch` → `GET https://hyperio-mc.github.io/dan-feed/feed.xml` via `hb_http`
+- `parse` → RSS `item` → `#{guid,title,link,description}`
+- `store`/`ingest` → `hb_store` `dan-<guid> => JSON` + `dan-index => [guid]` (cache FS)
+- `list` → `dan-index` count, `query q=OpenAI` → filter `title|description`
+- `harness.lua` `IngestDAN|QueryDAN|ListDAN|AgentRun|Bash` — uses `llm@1.0` (`qwen3.6` on Spark), `relay@1.0`, `query@1.0`, `lua@5.3a` bash
+
+```erlang
+hb_ao:resolve(#{<<"device">>=><<"harness@1.0">>, <<"path">>=><<"ingest">>}, #{}) % 1125 posts
+dev_harness:query(#{}, #{<<"q">> => <<"Muse Code">>}, #{}) % → 2 hits
+```
+```lua
+-- AO: aos <proc> < src/preloaded/agent/harness.lua
+Send({Target=Proc, Action="IngestDAN"})
+Send({Target=Proc, Action="QueryDAN", Tags={Query="Muse Code"}})
+```
+
 ## Forge publish
 
 ```bash
